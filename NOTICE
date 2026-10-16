@@ -1,0 +1,39 @@
+shdw — the AI-native video editor
+Copyright (C) 2026 d4niel-fr (https://github.com/d4niel-fr)
+https://github.com/d4niel-fr/shdw-video-editor
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License version 3 (see LICENSE),
+with the following ADDITIONAL TERMS under Section 7(b) and 7(c) of that license.
+
+ADDITIONAL TERMS — ATTRIBUTION
+
+1. Preserved author attribution (Section 7(b)).
+   Any copy, fork, modified version or derivative work of shdw that you convey,
+   distribute or make available to users (including over a network) must keep
+   a visible, reasonable attribution to the original author:
+
+       "Based on shdw by d4niel-fr — https://github.com/d4niel-fr/shdw-video-editor"
+
+   This attribution must appear:
+     a) in the README (or equivalent primary documentation) of your project, and
+     b) in the application's "About" screen, credits, or settings page if your
+        version has a user interface.
+
+   You must also keep this NOTICE file and all existing copyright headers intact.
+
+2. Marking of modified versions (Section 7(c)).
+   Modified versions must be clearly marked as different from the original and
+   must not be presented as the official shdw release or as endorsed by the
+   original author.
+
+3. Name (Section 7(e)).
+   This license does not grant rights to use the name "shdw" or its logo as the
+   name or branding of a different product, except to describe accurately that
+   your work is based on shdw as required above.
+
+Everything else follows the GNU AGPL v3: you may use, study, share and modify
+shdw, but if you distribute it (or run a modified version as a network service)
+you must release your source under the same license, with these terms intact.
+
+Third-party components keep their own licenses (Tauri, GSAP, FFmpeg, etc.).
