@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod audio;
 mod control;
 mod decoder;
 mod export;
@@ -8,7 +9,9 @@ mod html;
 mod media;
 mod mediaproto;
 mod project;
+mod security;
 mod tools;
+mod whisper;
 
 use tauri::Manager;
 
@@ -51,6 +54,7 @@ fn main() {
             media::make_proxy,
             media::mixdown,
             media::transcribe,
+            audio::extract_audio,
             media::detect_scenes,
             media::detect_silence,
             media::loudness,
@@ -66,6 +70,7 @@ fn main() {
             agent::agent_kill_pid,
             control::control_respond,
             control::control_port,
+            control::control_resolve_path,
             decoder::decoder_open,
             decoder::decoder_read,
             decoder::decoder_close_all,

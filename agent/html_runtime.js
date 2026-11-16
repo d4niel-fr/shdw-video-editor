@@ -7,6 +7,7 @@
   let T = 0; // ms
   const EPOCH = 1700000000000;
   const realSetTimeout = window.setTimeout.bind(window);
+  const realClearTimeout = window.clearTimeout.bind(window);
   let rafQ = new Map(); let rafId = 1;
   const errors = [];
   const frameFns = [];
@@ -26,8 +27,22 @@
   console.error = (...a) => { errors.push(a.map(String).join(" ")); origErr(...a); };
 
   const tick = () => new Promise((r) => realSetTimeout(r, 0));
-  // user hooks can't stall the renderer: cap each at 6s
-  const capped = (p, what) => Promise.race([Promise.resolve(p), new Promise((r) => realSetTimeout(() => { errors.push(what + " timed out after 6s"); r(); }, 6000))]);
+  // User hooks can't stall the renderer. Two limits: each hook gets HOOK_CAP_MS, and all hooks of one exact
+  // frame() share FRAME_BUDGET_MS, which must stay well below the host's 25 s per-call deadline (html.rs):
+  // past that the host kills and restarts the whole headless browser.
+  const HOOK_CAP_MS = 6000, FRAME_BUDGET_MS = 15000;
+  let budgetEnd = Infinity; // set per exact frame(); live preview has no budget
+  // Only a real Promise (async function) is awaited. GSAP timelines and tweens are thenables that resolve when
+  // the animation *completes*; `t => tl.time(t)` returns one, so awaiting it burned the full cap on every frame.
+  const isPromise = (p) => Object.prototype.toString.call(p) === "[object Promise]";
+  const capped = (p, what) => {
+    if (!isPromise(p)) return Promise.resolve();
+    const ms = Math.max(0, Math.min(HOOK_CAP_MS, budgetEnd - _perfNow()));
+    let timer;
+    const timeout = new Promise((r) => { timer = realSetTimeout(() => { errors.push(what + " timed out after " + ms / 1000 + "s"); r(); }, ms); });
+    // cancel the timer once p settles: an uncancelled one would still fire later and report a timeout that never happened
+    return Promise.race([p, timeout]).finally(() => realClearTimeout(timer));
+  };
 
   const api = {
     width: +q.get("w") || innerWidth,
@@ -68,6 +83,10 @@
       try { for (const a of document.getAnimations()) { a.pause(); a.currentTime = T; } } catch (e) {}
     },
     async frame(t, params, duration) {
+      budgetEnd = _perfNow() + FRAME_BUDGET_MS;
+      try { return await api.frameInner(t, params, duration); } finally { budgetEnd = Infinity; }
+    },
+    async frameInner(t, params, duration) {
       api.apply(t, params, duration);
       // <video>/<audio> inside the composition
       const vids = [...document.querySelectorAll("video")];

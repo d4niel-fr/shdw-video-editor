@@ -216,12 +216,16 @@ Offline libraries are pre-installed in `motion/lib/`: `gsap.min.js`, `SplitText.
 `DrawSVGPlugin.min.js`, `MorphSVGPlugin.min.js`, `MotionPathPlugin.min.js`, `CustomEase.min.js`,
 `ScrambleTextPlugin.min.js`, `TextPlugin.min.js`, `Physics2DPlugin.min.js` (all GSAP plugins are free).
 Load with `<script src="lib/gsap.min.js"></script>`. CDN scripts (cdnjs, jsdelivr — three.js,
-lottie-web, d3, anime.js) also work when online. Reference project files relatively (`../media/x.png`, `../fonts/X.woff2`).
+lottie-web, d3, anime.js) also work when online. Compositions can reach only `cdnjs.cloudflare.com`,
+`cdn.jsdelivr.net`, `unpkg.com` and Google Fonts; every other host is blocked, so download other assets into the project. Reference project files relatively (`../media/x.png`, `../fonts/X.woff2`).
 
 Rules:
 1. `html, body { background: transparent; margin: 0; overflow: hidden }` — transparency becomes alpha.
 2. Lay out in the comp size: use `vw/vh` units or `shdw.width/height` (the viewport equals the timeline resolution).
-3. Build ONE paused master timeline and drive it from `shdw.onFrame(t => tl.time(t))`. Rebuild it if
+3. Build ONE paused master timeline and drive it from `shdw.onFrame(t => { tl.time(t); })` — use a block body:
+   `tl.time(t)` returns the timeline, and a hook's return value is awaited if it is a Promise (timelines are
+   ignored, but keep the habit). Hooks are capped at 6 s each and 15 s per frame; hits show up in `GET /errors`.
+   Rebuild it if
    `shdw.params` or `shdw.duration` change (see the templates `motion/keynote-reveal.html`, `motion/stat-ring.html`).
 4. Never use wall-clock timers (`setInterval`, `setTimeout` for animation). Everything is a function of `t`.
 5. Exit animation should finish by `shdw.duration`. Entrances start at t = 0.
@@ -325,12 +329,29 @@ export default { name: "Neon Add", fragment: `vec3 blend(vec3 base, vec3 top) { 
 
 ## Fonts
 Drop font files into `fonts/` (e.g. download from Google Fonts with
-`curl -L -o fonts/Inter.ttf "<url>"`). The family name = file name without extension.
+`curl -L -o fonts/Inter.ttf "<url>"` — needs full-access mode; otherwise ask the user to drop the font file
+into `fonts/`). The family name = file name without extension.
 You can also *design* a custom display font: write a motion module that draws glyphs as vector paths.
 
 ## Control API — the running editor (http://127.0.0.1:{{PORT}})
 
-The port is also in `.shdw/port`. Use `curl` (Windows: `curl.exe`).
+**Calling the API.** Use the helper: it adds the per-launch auth token and port for you and only ever
+talks to 127.0.0.1. Run it from the project folder (your working directory) and quote paths and JSON bodies:
+
+```
+{{API}} GET /state
+{{API}} GET "/frame?t=2.5&path=renders/check.png&scale=0.5"
+{{API}} POST /import '{"paths":["/abs/file.mp4"],"copy":true}'
+{{API}} POST /export '{"out":"renders/final.mp4","codec":"h264"}'
+```
+
+The table below lists method and path only. Raw `curl` also works, but only in full-access mode: send the
+header `X-Shdw-Token: <contents of .shdw/token>`. Calls without a valid token get `401`. Never print the token
+in chat or write it into project files.
+
+**Path rules.** `path` (frames) and `out` (exports) must resolve inside this project folder and end in
+`png jpg jpeg mp4 m4v mov mkv webm gif`, otherwise the API answers `403`. `POST /import` accepts existing
+media files (video/audio/image) from anywhere, but not files inside hidden folders.
 
 | Method & path | What it does |
 | --- | --- |
@@ -342,7 +363,7 @@ The port is also in `.shdw/port`. Use `curl` (Windows: `curl.exe`).
 | `POST /seek?t=3` · `POST /play` · `POST /pause` | Transport. |
 | `POST /import` body `{"paths":["C:/abs/file.mp4"], "copy": true}` | Import files into the media pool (probes duration/size). Returns media entries with ids. |
 | `POST /transcribe?media=m_intro` | Whisper transcript → `transcripts/m_intro.json` `{segments:[{start,end,text}]}` (source-time seconds). |
-| `POST /captions?media=m_intro&track=S1` | Transcribe (if needed) and lay subtitle clips for every clip using that media. |
+| `POST /captions?media=m_intro&track=S1` | Transcribe (if needed) and lay subtitle clips for every clip using that media. Only clips on **video** tracks are captioned: put narration inside a video clip with a linked audio clip. |
 | `POST /export` body `{"out":"renders/final.mp4","codec":"h264"}` | Render the timeline (codecs: h264, h265, prores, prores4444, vp9, gif). |
 | `POST /process?clip=c_x&op=stabilize` | Clip processing — see "Clip processing". |
 | `GET /errors` | Module compile errors / runtime errors from your code. **Check after writing modules.** |

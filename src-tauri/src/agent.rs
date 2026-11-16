@@ -1,6 +1,8 @@
 //! Runs Claude Code / Codex CLI sessions inside the project folder and streams
 //! their JSON event output to the chat panel.
 
+use crate::project::install_api_helper;
+use crate::security;
 use crate::tools;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -32,50 +34,25 @@ pub fn agent_start(app: AppHandle, state: State<AgentState>, req: AgentRequest) 
     let exe = tools::find(&req.provider).ok_or_else(|| format!("`{}` CLI not found on PATH", req.provider))?;
     let mut c = tools::tool_command(&exe);
     c.current_dir(&req.cwd);
-    match req.provider.as_str() {
-        "claude" => {
-            c.args(["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]);
-            if req.skip_permissions {
-                c.arg("--dangerously-skip-permissions");
-            } else {
-                c.args(["--permission-mode", "acceptEdits"]);
-            }
-            if let Some(s) = &req.session_id {
-                c.args(["--resume", s]);
-            }
-            if let Some(m) = req.model.as_ref().filter(|m| !m.is_empty()) {
-                c.args(["--model", m]);
-            }
-            for d in &req.extra_dirs {
-                c.args(["--add-dir", d]);
-            }
-        }
-        "codex" => {
-            c.arg("exec");
-            if let Some(s) = &req.session_id {
-                c.args(["resume", s]);
-            }
-            c.args(["--json", "--skip-git-repo-check"]);
-            if req.skip_permissions {
-                c.arg("--dangerously-bypass-approvals-and-sandbox");
-            } else {
-                c.arg("--full-auto");
-            }
-            if req.session_id.is_none() {
-                c.arg("-C").arg(&req.cwd);
-            }
-            if let Some(m) = req.model.as_ref().filter(|m| !m.is_empty()) {
-                c.args(["-m", m]);
-            }
-            c.arg("-");
-        }
+    // argument lists live in security.rs so the permission defaults are unit-tested
+    let helper = install_api_helper();
+    let helper_path = helper.as_deref().and_then(|p| p.to_str()).unwrap_or("");
+    let args = match req.provider.as_str() {
+        "claude" => security::claude_args(req.skip_permissions, req.session_id.as_deref(), req.model.as_deref(), &req.extra_dirs, helper_path),
+        "codex" => security::codex_args(req.skip_permissions, req.session_id.as_deref(), req.model.as_deref(), &req.cwd),
         p => return Err(format!("unknown provider {p}")),
-    }
+    };
+    c.args(&args);
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     c.env("SHDW", "1").env("PATH", tools::child_path());
+
     let mut child = c.spawn().map_err(|e| format!("failed to start {}: {e}", req.provider))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let prompt = req.prompt.clone();
+        let prompt = if helper_path.is_empty() {
+            req.prompt.clone()
+        } else {
+            format!("{}\n[Control API helper: {helper_path} GET /state  (run from the project folder; it adds the auth token)]", req.prompt)
+        };
         std::thread::spawn(move || {
             let _ = stdin.write_all(prompt.as_bytes());
         });

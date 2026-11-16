@@ -26,8 +26,11 @@ export const stem = (p: string) => basename(p).replace(/\.[^.]+$/, "");
 export const ext = (p: string) => (basename(p).match(/\.([^.]+)$/)?.[1] ?? "").toLowerCase();
 export const dirname = (p: string) => norm(p).split("/").slice(0, -1).join("/");
 
+/** Tauri serves custom protocols as http://<scheme>.localhost on Windows/Android and <scheme>://localhost elsewhere (macOS, Linux). */
+export const MEDIA_ORIGIN = /Windows|Android/i.test(navigator.userAgent) ? "http://media.localhost" : "media://localhost";
+
 /** Webview URL for a local file (CORS + range enabled custom protocol). */
-export const mediaUrl = (absPath: string) => `http://media.localhost/${encodeURIComponent(norm(absPath))}`;
+export const mediaUrl = (absPath: string) => `${MEDIA_ORIGIN}/${encodeURIComponent(norm(absPath))}`;
 
 export const VIDEO_EXT = ["mp4", "mov", "m4v", "webm", "mkv", "avi", "mxf", "mts", "m2ts", "wmv", "flv", "3gp", "ts", "mpg", "mpeg"];
 export const AUDIO_EXT = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "aif", "aiff", "wma"];

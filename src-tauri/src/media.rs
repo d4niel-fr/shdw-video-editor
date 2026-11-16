@@ -1,6 +1,8 @@
 //! Media operations backed by ffmpeg/ffprobe: probing, thumbnails, waveform
 //! peaks, optimized-media proxies, audio mixdown and whisper transcription.
 
+use crate::security;
+use crate::whisper;
 use crate::tools;
 use serde::Deserialize;
 use std::io::Read;
@@ -187,56 +189,151 @@ pub async fn mixdown(clips: Vec<AudioClip>, total: f64, out: String) -> Result<S
     .map_err(|e| e.to_string())?
 }
 
+fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher).map_err(|e| e.to_string())?;
+    // token_from_bytes is plain lowercase hex
+    Ok(security::token_from_bytes(&hasher.finalize()))
+}
+
+/// Locate (downloading if needed) a Whisper model. Only models pinned in
+/// `security::whisper_model` are accepted and every download must match its SHA-256.
 fn whisper_model(name: &str) -> Result<PathBuf, String> {
+    let pin = security::whisper_model(name).ok_or_else(|| format!("unknown whisper model '{name}'"))?;
     let dir = tools::app_data_dir().join("models");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let file = dir.join(format!("ggml-{name}.bin"));
-    if file.is_file() && std::fs::metadata(&file).map(|m| m.len() > 1_000_000).unwrap_or(false) {
-        return Ok(file);
+    let file = dir.join(&pin.file);
+    let marker = dir.join(format!("{}.verified", pin.file));
+    let len_of = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+
+    if file.is_file() {
+        let stamp = |len: u64| format!("{} {}", pin.sha256, len);
+        let cached_ok = matches!((std::fs::read_to_string(&marker), len_of(&file)), (Ok(m), Some(len)) if m.trim() == stamp(len));
+        if cached_ok {
+            return Ok(file);
+        }
+        if sha256_file(&file).ok().as_deref() == Some(pin.sha256) {
+            let _ = std::fs::write(&marker, stamp(len_of(&file).unwrap_or(0)));
+            return Ok(file);
+        }
+        let _ = std::fs::remove_file(&file); // corrupt or tampered: fetch again
     }
-    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin");
-    let st = tools::cmd("curl.exe")
-        .args(["-L", "--fail", "-s", "-o"])
-        .arg(&file)
+
+    let part = dir.join(format!("{}.part", pin.file));
+    let _ = std::fs::remove_file(&part);
+    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}", pin.file);
+    let st = tools::cmd(if cfg!(windows) { "curl.exe" } else { "curl" })
+        .args(["-L", "--fail", "-s", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "-o"])
+        .arg(&part)
         .arg(&url)
         .status()
         .map_err(|e| format!("curl failed: {e}"))?;
     if !st.success() {
-        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(&part);
         return Err(format!("could not download whisper model {name}"));
     }
+    let digest = sha256_file(&part)?;
+    if digest != pin.sha256 {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("whisper model {name} failed its SHA-256 check (got {digest}); not using it"));
+    }
+    let len = len_of(&part).unwrap_or(0);
+    std::fs::rename(&part, &file).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(&marker, format!("{} {}", pin.sha256, len));
     Ok(file)
 }
 
-/// Speech-to-text via ffmpeg's built-in whisper.cpp filter. Returns JSON lines
-/// of segments `{start,end,text}` (seconds).
+/// A temp-file stem unique per process *and* per call (concurrent transcriptions must not collide).
+fn temp_stem() -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!("shdw_tx_{}_{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)))
+}
+
+/// Does this ffmpeg build include the `whisper` filter? (checked once per run)
+fn ffmpeg_has_whisper(ffmpeg: &Path) -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        tools::cmd(ffmpeg)
+            .args(["-hide_banner", "-filters"])
+            .output()
+            .map(|o| whisper::filters_include_whisper(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or(false)
+    })
+}
+
+fn transcribe_with_ffmpeg(ffmpeg: &Path, media: &str, model: &Path, language: &str) -> Result<String, String> {
+    let tmp = temp_stem().with_extension("json");
+    let esc = |p: &Path| p.to_string_lossy().replace('\\', "/").replace(':', "\\\\:");
+    let filter = format!(
+        "aresample=16000,aformat=sample_fmts=flt:channel_layouts=mono,whisper=model={}:language={language}:queue=3:use_gpu=false:destination={}:format=json",
+        esc(model),
+        esc(&tmp)
+    );
+    let o = tools::cmd(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(media)
+        .args(["-vn", "-af", &filter, "-f", "null", "-"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).to_string());
+    }
+    let txt = std::fs::read_to_string(&tmp).map_err(|e| format!("no transcript produced: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(txt)
+}
+
+/// Fallback for ffmpeg builds without the whisper filter: 16 kHz WAV via ffmpeg, then whisper.cpp.
+fn transcribe_with_cli(ffmpeg: &Path, media: &str, model: &Path, language: &str) -> Result<String, String> {
+    let cli = tools::find("whisper-cli").ok_or(
+        "auto-captions need whisper support: this ffmpeg has no `whisper` filter. Install whisper.cpp (macOS: brew install whisper.cpp) or an ffmpeg built with the whisper filter.",
+    )?;
+    let stem = temp_stem();
+    let wav = stem.with_extension("wav");
+    let json = PathBuf::from(format!("{}.json", stem.display()));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&wav);
+        let _ = std::fs::remove_file(&json);
+    };
+    let o = tools::cmd(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(media)
+        .args(["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])
+        .arg(&wav)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !o.status.success() {
+        cleanup();
+        return Err(String::from_utf8_lossy(&o.stderr).to_string());
+    }
+    let o = tools::cmd(&cli).args(whisper::cli_args(model, &wav, &stem, language)).output().map_err(|e| format!("whisper-cli failed to start: {e}"))?;
+    let result = if o.status.success() {
+        std::fs::read_to_string(&json).map_err(|e| format!("no transcript produced: {e}")).and_then(|raw| whisper::cli_json_to_lines(&raw))
+    } else {
+        Err(String::from_utf8_lossy(&o.stderr).to_string())
+    };
+    cleanup();
+    result
+}
+
+/// Speech-to-text. Uses ffmpeg's `whisper` filter when present, otherwise whisper.cpp's `whisper-cli`;
+/// returns JSON lines `{start,end,text}` (milliseconds) either way.
 #[tauri::command]
 pub async fn transcribe(app: AppHandle, path: String, model: Option<String>, language: Option<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let model_name = model.unwrap_or_else(|| "base".into());
+        let language = whisper::validate_language(&language.unwrap_or_else(|| "auto".into()))?;
         let _ = app.emit("transcribe-status", format!("preparing model {model_name}"));
         let model_path = whisper_model(&model_name)?;
-        let tmp = std::env::temp_dir().join(format!("shdw_tx_{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        let esc = |p: &Path| p.to_string_lossy().replace('\\', "/").replace(':', "\\\\:");
-        let filter = format!(
-            "aresample=16000,aformat=sample_fmts=flt:channel_layouts=mono,whisper=model={}:language={}:queue=3:use_gpu=false:destination={}:format=json",
-            esc(&model_path),
-            language.unwrap_or_else(|| "auto".into()),
-            esc(&tmp)
-        );
+        let ffmpeg = tools::ffmpeg()?;
         let _ = app.emit("transcribe-status", "transcribing");
-        let o = tools::cmd(tools::ffmpeg()?)
-            .args(["-hide_banner", "-loglevel", "error", "-i"])
-            .arg(&path)
-            .args(["-vn", "-af", &filter, "-f", "null", "-"])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !o.status.success() {
-            return Err(String::from_utf8_lossy(&o.stderr).to_string());
-        }
-        let txt = std::fs::read_to_string(&tmp).map_err(|e| format!("no transcript produced: {e}"))?;
-        let _ = std::fs::remove_file(&tmp);
+        let txt = if ffmpeg_has_whisper(&ffmpeg) {
+            transcribe_with_ffmpeg(&ffmpeg, &path, &model_path, &language)?
+        } else {
+            transcribe_with_cli(&ffmpeg, &path, &model_path, &language)?
+        };
         let _ = app.emit("transcribe-status", "done");
         Ok(txt)
     })

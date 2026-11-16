@@ -118,11 +118,11 @@ pub fn tool_command(path: &Path) -> Command {
 }
 
 pub fn ffmpeg() -> Result<PathBuf, String> {
-    find("ffmpeg").ok_or_else(|| "ffmpeg not found — install with: winget install Gyan.FFmpeg".into())
+    find("ffmpeg").ok_or_else(|| "ffmpeg not found — install it (macOS: brew install ffmpeg, Windows: winget install Gyan.FFmpeg)".into())
 }
 
 pub fn ffprobe() -> Result<PathBuf, String> {
-    find("ffprobe").ok_or_else(|| "ffprobe not found — install with: winget install Gyan.FFmpeg".into())
+    find("ffprobe").ok_or_else(|| "ffprobe not found — it ships with FFmpeg (macOS: brew install ffmpeg, Windows: winget install Gyan.FFmpeg)".into())
 }
 
 pub fn version_of(path: &Path) -> Option<String> {

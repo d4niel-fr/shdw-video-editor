@@ -3,6 +3,7 @@
 //! the headless Microsoft Edge that ships with Windows, driven over the Chrome
 //! DevTools Protocol. Time is virtualized, so every frame is deterministic.
 
+use crate::security;
 use crate::tools;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -72,7 +73,12 @@ impl Browser {
                 "--hide-scrollbars", "--mute-audio", "--allow-file-access-from-files", "--disable-background-timer-throttling",
                 "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows", "--force-color-profile=srgb",
                 "--autoplay-policy=no-user-gesture-required", "--disable-features=Translate,MediaRouter",
+                // a dead proxy blocks every request except loopback and the CDN allow-list below (raw IPs
+                // and arbitrary hosts included); WebRTC may not use direct UDP; Chrome makes no background calls
+                "--proxy-server=http://127.0.0.1:9", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--disable-background-networking", "--disable-component-update", "--disable-sync", "--no-pings",
             ])
+            .arg(format!("--proxy-bypass-list={}", security::chrome_proxy_bypass()))
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg("about:blank")
             .stderr(Stdio::piped())
@@ -299,15 +305,50 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 #[allow(dead_code)]
 fn _unused(_: &Path) {}
 
+/// PID of the shdw instance that owns a renderer, read from `...render-profile-<pid>-<slot>...`
+/// (works on a profile directory name and on a Chrome command line alike).
+fn profile_owner_pid(s: &str) -> Option<u32> {
+    const MARK: &str = "render-profile-";
+    let rest = &s[s.find(MARK)? + MARK.len()..];
+    rest.split('-').next()?.parse().ok()
+}
+
+/// True for a headless browser started by `Browser::launch`: `--headless` plus a `--user-data-dir=...render-profile-...`
+/// argument. Matching on the profile argument (not on loose text) keeps the orphan scan from ever killing
+/// an unrelated process whose command line merely mentions these words.
+fn is_renderer_command(command: &str) -> bool {
+    command.contains("--headless")
+        && command.contains("shdw")
+        && command.split("--user-data-dir=").nth(1).is_some_and(|rest| rest.contains("render-profile-"))
+}
+
+/// A renderer or profile is orphaned only when the shdw process that created it is gone.
+/// (Several editors can run at once, one per project: another live instance's renderer is not ours to kill.)
+fn is_orphan(s: &str, me: u32, alive: impl Fn(u32) -> bool) -> bool {
+    matches!(profile_owner_pid(s), Some(pid) if pid != me && !alive(pid))
+}
+
+#[cfg(not(windows))]
+fn pid_alive(pid: u32) -> bool {
+    // if `kill` itself cannot run, assume alive: never kill on doubt
+    tools::cmd("kill").args(["-0", &pid.to_string()]).status().map(|s| s.success()).unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    tools::cmd("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())).unwrap_or(true)
+}
+
 /// Startup: kill headless renderers orphaned by an earlier crash (they lock their
-/// profiles and eat CPU) and delete stale profile dirs.
+/// profiles and eat CPU) and delete stale profile dirs. Renderers owned by another
+/// running shdw instance are left alone.
 pub fn cleanup_orphans() {
     std::thread::spawn(|| {
         let me = std::process::id();
         #[cfg(windows)]
         {
         let script = format!(
-            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' or Name='chrome.exe'\" | Where-Object {{ $_.CommandLine -like '*shdw*render-profile*' -and $_.CommandLine -notlike '*render-profile-{me}-*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' or Name='chrome.exe'\" | Where-Object {{ $_.CommandLine -like '*shdw*render-profile*' }} | ForEach-Object {{ $m = [regex]::Match($_.CommandLine, 'render-profile-(\\d+)-'); if ($m.Success) {{ $o = [int]$m.Groups[1].Value; if ($o -ne {me} -and -not (Get-Process -Id $o -ErrorAction SilentlyContinue)) {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} }}"
         );
         let _ = tools::cmd("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).status();
         }
@@ -316,7 +357,7 @@ pub fn cleanup_orphans() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let line = line.trim_start();
                 let (pid, command) = line.split_once(' ').unwrap_or((line, ""));
-                if command.contains("render-profile-") && command.contains("shdw") && !command.contains(&format!("render-profile-{me}-")) {
+                if is_renderer_command(command) && is_orphan(command, me, pid_alive) {
                     let _ = tools::cmd("kill").args(["-9", pid]).status();
                 }
             }
@@ -324,10 +365,63 @@ pub fn cleanup_orphans() {
         if let Ok(rd) = std::fs::read_dir(tools::app_data_dir()) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with("render-profile-") && !name.starts_with(&format!("render-profile-{me}-")) {
+                if name.starts_with("render-profile-") && is_orphan(&name, me, pid_alive) {
                     let _ = std::fs::remove_dir_all(e.path());
                 }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_owner_pid_from_profile_dir_and_command_line() {
+        assert_eq!(profile_owner_pid("render-profile-39482-1"), Some(39482));
+        let cmd = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --user-data-dir=/Users/a/Library/Application Support/shdw/render-profile-41406-0 about:blank";
+        assert_eq!(profile_owner_pid(cmd), Some(41406));
+    }
+
+    #[test]
+    fn no_owner_pid_when_name_does_not_match() {
+        assert_eq!(profile_owner_pid("render-profile-abc-1"), None);
+        assert_eq!(profile_owner_pid("Google Chrome --headless"), None);
+        assert_eq!(profile_owner_pid(""), None);
+    }
+
+    #[test]
+    fn never_orphans_its_own_renderers() {
+        assert!(!is_orphan("render-profile-100-0", 100, |_| false));
+    }
+
+    #[test]
+    fn leaves_renderers_of_another_running_instance_alone() {
+        // regression: starting a second project used to kill the first project's headless Chrome
+        assert!(!is_orphan("render-profile-39482-1", 41406, |pid| pid == 39482));
+    }
+
+    #[test]
+    fn reaps_renderers_whose_owner_is_gone() {
+        assert!(is_orphan("render-profile-39482-1", 41406, |_| false));
+    }
+
+    #[test]
+    fn ignores_things_that_are_not_renderer_profiles() {
+        assert!(!is_orphan("audio-cache", 41406, |_| false));
+        assert!(!is_orphan("render-profile-notapid-1", 41406, |_| false));
+    }
+
+    #[test]
+    fn recognises_only_real_renderer_browsers() {
+        let real = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --remote-debugging-port=0 --user-data-dir=/Users/a/Library/Application Support/shdw/render-profile-41406-0 about:blank";
+        assert!(is_renderer_command(real));
+        // regression: the old check was "contains render-profile- and shdw", which also killed any shell
+        // whose command line merely mentioned them (a tool shell running pgrep, a decoy, a log grep)
+        assert!(!is_renderer_command("sh -c sleep 300; echo d # render-profile-4242-9 shdw decoy"));
+        assert!(!is_renderer_command("/bin/zsh -c pgrep -f 'render-profile-.*about:blank' # shdw.app"));
+        assert!(!is_renderer_command("Google Chrome --headless=new --user-data-dir=/tmp/other-profile about:blank"));
+        assert!(!is_renderer_command("Google Chrome --user-data-dir=/x/shdw/render-profile-1-0 about:blank")); // not headless
+    }
 }

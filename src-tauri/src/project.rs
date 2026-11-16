@@ -1,9 +1,12 @@
 //! Project folder scaffolding, generic file access and the folder watcher that
 //! hot-reloads edits made by the coding agent.
 
+use crate::control::ControlState;
+use crate::security;
 use crate::tools;
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::ipc::{InvokeBody, Request};
@@ -25,16 +28,69 @@ pub struct Entry {
     modified: f64,
 }
 
-fn write_guides(dir: &Path, port: u16) -> Result<(), String> {
-    let guide = AGENT_GUIDE.replace("{{PORT}}", &port.to_string());
+#[cfg(unix)]
+fn restrict_dir(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+}
+#[cfg(not(unix))]
+fn restrict_dir(_p: &Path) {}
+
+/// Write a secret readable only by the current user.
+#[cfg(unix)]
+fn write_private(path: &Path, content: &str) -> Result<(), String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path).map_err(|e| e.to_string())?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    f.write_all(content.as_bytes()).map_err(|e| e.to_string())
+}
+#[cfg(not(unix))]
+fn write_private(path: &Path, content: &str) -> Result<(), String> {
+    std::fs::write(path, content).map_err(|e| e.to_string())
+}
+
+/// Install the control-API helper at `~/.shdw/bin/shdw-api`, outside every project folder so an
+/// agent confined to a project cannot rewrite it. Returns None where it is unsupported (Windows).
+#[cfg(unix)]
+pub fn install_api_helper() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".shdw").join("bin");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("shdw-api");
+    let tmp = dir.join(format!("shdw-api.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, security::API_HELPER_SCRIPT).ok()?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+#[cfg(not(unix))]
+pub fn install_api_helper() -> Option<PathBuf> {
+    None
+}
+
+fn write_guides(dir: &Path, port: u16, token: Option<&str>, helper: Option<&Path>) -> Result<(), String> {
+    let api = helper.map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "shdw-api (unavailable on this platform: use curl with the X-Shdw-Token header from .shdw/token)".into());
+    let guide = AGENT_GUIDE.replace("{{PORT}}", &port.to_string()).replace("{{API}}", &api);
     std::fs::write(dir.join("CLAUDE.md"), &guide).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("AGENTS.md"), &guide).map_err(|e| e.to_string())?;
-    let _ = std::fs::write(dir.join(".shdw").join("port"), port.to_string());
+    let private = dir.join(".shdw");
+    std::fs::create_dir_all(&private).map_err(|e| e.to_string())?;
+    restrict_dir(&private);
+    // keep the token and chat history out of version control
+    let _ = std::fs::write(private.join(".gitignore"), "*\n");
+    let _ = std::fs::write(private.join("port"), port.to_string());
+    let token_path = private.join("token");
+    match token {
+        Some(t) => write_private(&token_path, t)?,
+        None => {
+            let _ = std::fs::remove_file(&token_path);
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
-pub fn project_init(dir: String, port: u16, default_project: String) -> Result<String, String> {
+pub fn project_init(control: State<ControlState>, dir: String, port: u16, default_project: String) -> Result<String, String> {
     let d = PathBuf::from(&dir);
     for sub in PROJECT_DIRS {
         std::fs::create_dir_all(d.join(sub)).map_err(|e| e.to_string())?;
@@ -43,7 +99,8 @@ pub fn project_init(dir: String, port: u16, default_project: String) -> Result<S
     if !pj.exists() {
         std::fs::write(&pj, default_project).map_err(|e| e.to_string())?;
     }
-    write_guides(&d, port)?;
+    let helper = install_api_helper();
+    write_guides(&d, port, control.token.get().map(String::as_str), helper.as_deref())?;
     std::fs::read_to_string(pj).map_err(|e| e.to_string())
 }
 
@@ -177,7 +234,15 @@ pub fn exists(path: String) -> bool {
 
 #[tauri::command]
 pub fn reveal(path: String) {
+    #[cfg(windows)]
     let _ = tools::cmd("explorer").arg(format!("/select,{}", path.replace('/', "\\"))).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = tools::cmd("open").arg("-R").arg(&path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = Path::new(&path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let _ = tools::cmd("xdg-open").arg(dir).spawn();
+    }
 }
 
 #[tauri::command]
