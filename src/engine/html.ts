@@ -1,7 +1,7 @@
 // HTML motion clips: frames are rendered by headless Edge in Rust (html.rs)
 // and cached here as GPU-ready ImageBitmaps (Resolve-style render cache).
 
-import { invoke, join, fs } from "../ipc";
+import { invoke, listen, join, fs } from "../ipc";
 import { store } from "../store";
 import { Clip } from "../model";
 import { TEMPLATES } from "../templates";
@@ -63,6 +63,7 @@ class HtmlFrames {
   version(path: string) { return this.versions.get(path) ?? 0; }
   invalidate(rel: string) {
     this.versions.set(rel, this.version(rel) + 1);
+    store.clearErrors(rel); // the composition changed: old hook/render errors no longer apply
     for (const k of [...this.blobs.keys()]) if (k.startsWith(rel + "|")) { this.blobBytes -= this.blobs.get(k)!.size; this.blobs.delete(k); }
     for (const k of [...this.decoded.keys()]) if (k.startsWith(rel + "|")) { this.decoded.get(k)!.close(); this.decoded.delete(k); }
     this.queue = this.queue.filter((j) => { if (j.key.startsWith(rel + "|")) { j.done(null); return false; } return true; });
@@ -175,7 +176,6 @@ class HtmlFrames {
         const k = this.blobs.keys().next().value!;
         this.blobBytes -= this.blobs.get(k)!.size; this.blobs.delete(k);
       }
-      store.clearErrors(store.rel(j.path));
       j.done(blob);
       if (j.prio < 2) store.emit("frame-ready");
     } catch (e: any) {
@@ -232,3 +232,10 @@ class HtmlFrames {
 }
 
 export const htmlFrames = new HtmlFrames();
+
+// Errors raised inside a composition (hook timeouts, script errors) are reported by the renderer as an
+// "html-errors" event. They used to be dropped, so a stalled composition left GET /errors empty.
+void listen<{ path: string; errors: string[] }>("html-errors", (e) => {
+  const rel = store.rel(e.payload.path);
+  for (const message of e.payload.errors) store.error(rel, String(message));
+});

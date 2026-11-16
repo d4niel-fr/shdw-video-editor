@@ -6,14 +6,14 @@
 
 import { store } from "../store";
 import { Clip, clipEnd, prop } from "../model";
-import { norm } from "../ipc";
+import { norm, MEDIA_ORIGIN } from "../ipc";
 import { htmlFrames } from "./html";
 import { Renderer, Layer, LivePlan } from "./renderer";
 
 const PRELOAD = 2.5;     // seconds ahead to load upcoming compositions
 const MAX_FRAMES = 16;
 
-const liveUrl = (abs: string) => "http://media.localhost/live/" + norm(abs).split("/").map(encodeURIComponent).join("/");
+const liveUrl = (abs: string) => `${MEDIA_ORIGIN}/live/` + norm(abs).split("/").map(encodeURIComponent).join("/");
 
 const CSS_BLENDS = new Set(["multiply", "screen", "overlay", "darken", "lighten", "colorDodge", "colorBurn", "hardLight", "softLight", "difference", "exclusion", "hue", "saturation", "color", "luminosity"]);
 const kebab = (s: string) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
@@ -72,6 +72,8 @@ class LiveHtml {
     if (f && f.prev && f.prev !== prev) f.prev.remove();
     const el = document.createElement("iframe");
     el.setAttribute("scrolling", "no");
+    // compositions may run scripts but cannot navigate the editor, open popups or submit forms
+    el.setAttribute("sandbox", "allow-scripts allow-same-origin");
     Object.assign(el.style, { position: "absolute", left: "0", top: "0", width: W + "px", height: H + "px", border: "0", background: "transparent", colorScheme: "normal", opacity: "0", pointerEvents: "none" });
     const nf: Frame = { el, prev, key, clip: c, loaded: false, drawn: false, lastT: -1 };
     el.addEventListener("load", () => { nf.loaded = true; store.emit("frame-ready"); });

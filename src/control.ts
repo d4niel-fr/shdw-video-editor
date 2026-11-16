@@ -1,6 +1,6 @@
 // Answers HTTP requests the agent sends to the local control API.
 
-import { invoke, listen, fs, join, isAbs } from "./ipc";
+import { invoke, listen, fs } from "./ipc";
 import { store } from "./store";
 import { Renderer } from "./engine/renderer";
 import { renderFramePNG, renderContactSheet, exportVideo } from "./engine/exporter";
@@ -12,6 +12,23 @@ import { htmlFrames } from "./engine/html";
 import { sceneDetect, removeSilence, normalizeLoudness, detectBeats, processClip, PROCS } from "./processing";
 
 let queue: Promise<unknown> = Promise.resolve();
+
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
+/**
+ * Every path received over HTTP goes through the Rust jail: outputs must stay inside the
+ * project folder (media extensions only); imports must be existing media files.
+ */
+async function resolvePath(path: unknown, kind: "output" | "media"): Promise<string> {
+  if (typeof path !== "string") throw new HttpError(400, "path must be a string");
+  try {
+    return await invoke<string>("control_resolve_path", { root: store.dir, path, kind });
+  } catch (e) {
+    throw new HttpError(403, String(e));
+  }
+}
 
 /** Export quality as an x264/x265 CRF: accepts a number or words like "high". */
 function crf(q: unknown): number | undefined {
@@ -45,12 +62,11 @@ async function handle(renderer: Renderer, req: { id: number; method: string; url
   const u = new URL(req.url, "http://x");
   const q = (k: string) => u.searchParams.get(k);
   const body = (() => { try { return req.body ? JSON.parse(req.body) : {}; } catch { return {}; } })();
-  const out = (p: string) => (isAbs(p) ? p : join(store.dir, p));
   try {
     if (!store.dir && u.pathname !== "/state") return respond(req.id, 409, { error: "no project open" });
     switch (u.pathname) {
       case "/state":
-        return respond(req.id, 200, { projectDir: store.dir, playhead: store.playhead, playing: store.playing, selection: [...store.selection], duration: store.duration, page: store.page, renderCache: htmlFrames.stats, project: store.project, errors: store.errors.slice(-20) });
+        return respond(req.id, 200, { projectDir: store.dir, playhead: store.playhead, playing: store.playing, selection: [...store.selection], duration: store.duration, page: store.page, renderCache: htmlFrames.stats, project: store.project, errors: store.errors.slice(-20), playback: playback.report() });
       case "/errors":
         return respond(req.id, 200, { errors: store.errors.slice(-50) });
       case "/reload":
@@ -61,12 +77,12 @@ async function handle(renderer: Renderer, req: { id: number; method: string; url
         return respond(req.id, 200, { ok: true, playhead: store.playhead });
       case "/page": store.emit("set-page", q("name") ?? "edit"); return respond(req.id, 200, { ok: true });
       case "/select": store.select((q("ids") ?? "").split(",").filter(Boolean)); return respond(req.id, 200, { ok: true });
-      case "/play": playback.play(); return respond(req.id, 200, { ok: true });
-      case "/pause": playback.pause(); return respond(req.id, 200, { ok: true });
+      case "/play": if (q("capture") === "1") playback.startCapture(); playback.play(); return respond(req.id, 200, { ok: true });
+      case "/pause": playback.pause(); if (q("capture") === "0") playback.stopCapture(); return respond(req.id, 200, { ok: true });
       case "/frame": {
         await store.reloadFromDisk();
         const t = +(q("t") ?? store.playhead);
-        const path = out(q("path") ?? `renders/frame_${t.toFixed(2)}.png`);
+        const path = await resolvePath(q("path") ?? `renders/frame_${t.toFixed(2)}.png`, "output");
         store.clearErrors();
         const png = await renderFramePNG(renderer, t, +(q("scale") ?? 0.5));
         await fs.writeBytes(path, png);
@@ -75,14 +91,16 @@ async function handle(renderer: Renderer, req: { id: number; method: string; url
       case "/frames": {
         await store.reloadFromDisk();
         const from = +(q("from") ?? 0), to = +(q("to") ?? store.duration), count = Math.max(1, Math.min(24, +(q("count") ?? 6)));
-        const path = out(q("path") ?? "renders/contact_sheet.png");
+        const path = await resolvePath(q("path") ?? "renders/contact_sheet.png", "output");
         store.clearErrors();
         const png = await renderContactSheet(renderer, from, Math.max(from, to - 1 / store.fps), count, +(q("scale") ?? 0.3));
         await fs.writeBytes(path, png);
         return respond(req.id, 200, { path, from, to, count, errors: store.errors.slice(-10) });
       }
       case "/import": {
-        const media = await importFiles((body.paths ?? []).map((p: string) => out(p)), !!body.copy);
+        const paths: unknown = body.paths;
+        if (!Array.isArray(paths) || paths.length === 0 || paths.length > 500) throw new HttpError(400, "body.paths must be a non-empty array of file paths");
+        const media = await importFiles(await Promise.all(paths.map((p) => resolvePath(p, "media"))), !!body.copy);
         return respond(req.id, 200, { media });
       }
       case "/transcribe": {
@@ -112,13 +130,14 @@ async function handle(renderer: Renderer, req: { id: number; method: string; url
       }
       case "/export": {
         await store.reloadFromDisk();
-        const path = await exportVideo(renderer, { out: body.out ?? "renders/export.mp4", codec: body.codec ?? "h264", quality: crf(body.quality), from: body.from, to: body.to, width: body.width, height: body.height }, () => {});
+        const outPath = await resolvePath(body.out ?? "renders/export.mp4", "output");
+        const path = await exportVideo(renderer, { out: outPath, codec: body.codec ?? "h264", quality: crf(body.quality), from: body.from, to: body.to, width: body.width, height: body.height }, () => {});
         return respond(req.id, 200, { ok: true, path });
       }
       default:
         return respond(req.id, 404, { error: "unknown endpoint", endpoints: ["/state", "/errors", "/frame", "/frames", "/reload", "/seek", "/play", "/pause", "/import", "/transcribe", "/captions", "/export"] });
     }
   } catch (e: any) {
-    return respond(req.id, 500, { error: e?.message ?? String(e) });
+    return respond(req.id, e instanceof HttpError ? e.status : 500, { error: e?.message ?? String(e) });
   }
 }

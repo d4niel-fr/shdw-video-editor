@@ -43,7 +43,8 @@ export class AgentPanel {
   get provider(): Provider { return (localStorage.getItem("shdw.provider") as Provider) || "claude"; }
   set provider(p: Provider) { localStorage.setItem("shdw.provider", p); this.paintHead(); }
   get model() { return localStorage.getItem(`shdw.model.${this.provider}`) ?? ""; }
-  get skip() { return localStorage.getItem("shdw.skipPerms") !== "0"; }
+  /** Full access is strictly opt-in; the default is scoped (project-only edits, loopback-only shell). */
+  get skip() { return localStorage.getItem("shdw.skipPerms") === "1"; }
 
   constructor() {
     this.log = h("div", { class: "agent-log" });
@@ -84,7 +85,7 @@ export class AgentPanel {
     this.headAv.className = "av " + p;
     this.headAv.textContent = p === "claude" ? "✳" : "◎";
     this.headName.textContent = p === "claude" ? "Claude Code" : "Codex";
-    this.status.textContent = (this.model || "default model") + (this.skip ? " · full access" : " · auto-edit");
+    this.status.textContent = (this.model || "default model") + (this.skip ? " · FULL ACCESS (no prompts)" : " · scoped access");
   }
 
   private settings(e: MouseEvent) {
@@ -101,7 +102,7 @@ export class AgentPanel {
     box.append(h("div", { class: "col" },
       h("div", { class: "mh", style: { padding: 0 } }, "Agent CLI"), prov,
       h("div", { class: "mh", style: { padding: 0 } }, "Model"), model,
-      h("div", { class: "row" }, h("div", { class: "grow" }, h("div", {}, "Skip permissions"), h("div", { class: "faint", style: { fontSize: "11px" } }, this.provider === "claude" ? "--dangerously-skip-permissions" : "--dangerously-bypass-approvals-and-sandbox")), skip),
+      h("div", { class: "row" }, h("div", { class: "grow" }, h("div", {}, "Full access (dangerous)"), h("div", { class: "faint", style: { fontSize: "11px" } }, "Off (default): edits stay inside this project and the shell is limited to the editor's control API. On: runs with no permission prompts (" + (this.provider === "claude" ? "--dangerously-skip-permissions" : "--dangerously-bypass-approvals-and-sandbox") + "). Only enable for projects you made yourself.")), skip),
       h("div", { class: "mh", style: { padding: 0 } }, "Whisper model (transcripts)"), wm,
       h("div", { class: "faint", style: { fontSize: "11px" } }, `Runs in the project folder. Control API on port ${this.port}.`)));
     document.body.appendChild(box);
@@ -203,7 +204,7 @@ export class AgentPanel {
     const lines = [
       "", "---", "[shdw editor context — added automatically by the app]",
       `Project folder (cwd): ${store.dir}`,
-      `Control API: http://127.0.0.1:${this.port}  (read CLAUDE.md / AGENTS.md for the project format + API)`,
+      `Control API: http://127.0.0.1:${this.port}  (call it with the shdw-api helper described in CLAUDE.md / AGENTS.md, which also documents the project format)`,
       `Timeline: ${p.settings.width}x${p.settings.height} @ ${p.settings.fps}fps, duration ${store.duration.toFixed(2)}s, ${p.clips.length} clips, ${p.media.length} media. Playhead ${store.playhead.toFixed(2)}s.`,
     ];
     const sel = store.selectedClips();

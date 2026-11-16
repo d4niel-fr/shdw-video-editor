@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node --test src/engine/avsync.test.ts agent/html_runtime.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

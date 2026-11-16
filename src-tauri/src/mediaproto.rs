@@ -5,11 +5,27 @@
 //! path-style so relative URLs inside compositions resolve; HTML gets the shdw
 //! runtime injected ahead of any page script.
 
+use crate::security;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tauri::http::{Request, Response, StatusCode};
 
 const CHUNK: u64 = 4 * 1024 * 1024;
+
+/// Live HTML compositions may only load local content plus a few well-known CDNs, so a
+/// hostile composition has no endpoint to send data to (see `security::live_csp`).
+fn live_csp() -> &'static str {
+    static CSP: OnceLock<String> = OnceLock::new();
+    CSP.get_or_init(security::live_csp)
+}
+
+/// Canonical app-data dir (cache, models); exempt from the hidden-folder rule on Linux.
+fn app_data() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| std::fs::canonicalize(crate::tools::app_data_dir()).ok()).as_deref()
+}
 
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -69,13 +85,24 @@ fn err(code: StatusCode, msg: &str) -> Response<Vec<u8>> {
 pub fn serve(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let raw = req.uri().path().trim_start_matches('/');
     let live = raw.starts_with("live/");
-    let path = percent_decode(if live { &raw[5..] } else { raw });
-    let mut f = match File::open(&path) {
+    let requested = percent_decode(if live { &raw[5..] } else { raw });
+    // resolve symlinks first so every rule below applies to the real file
+    let canon = match std::fs::canonicalize(&requested) {
+        Ok(p) => p,
+        Err(_) => return err(StatusCode::NOT_FOUND, "not found"),
+    };
+    if !security::is_servable_with(&canon, app_data()) {
+        return err(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let path = canon.to_string_lossy().to_string();
+    let mut f = match File::open(&canon) {
         Ok(f) => f,
         Err(_) => return err(StatusCode::NOT_FOUND, "not found"),
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let ty = mime(&path);
+    // `?raw=1` asks for plain bytes (used to decode audio with fetch()): WebKit stalls fetch() of video/* responses
+    let raw = req.uri().query().map(|q| q.split('&').any(|kv| kv == "raw=1")).unwrap_or(false);
+    let ty = if raw { "application/octet-stream" } else { mime(&path) };
     let range = req.headers().get("range").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
     let base = || {
@@ -84,6 +111,7 @@ pub fn serve(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
             .header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
             .header("Accept-Ranges", "bytes")
             .header("Cache-Control", "no-cache")
+            .header("X-Content-Type-Options", "nosniff")
             .header("Content-Type", ty)
     };
 
@@ -131,7 +159,7 @@ pub fn serve(req: Request<Vec<u8>>) -> Response<Vec<u8>> {
         out.extend_from_slice(format!("<script>{}</script>", crate::html::RUNTIME).as_bytes());
         out.extend_from_slice(&buf[at..]);
         let n = out.len();
-        return base().status(StatusCode::OK).header("Content-Length", n.to_string()).body(out).unwrap();
+        return base().status(StatusCode::OK).header("Content-Length", n.to_string()).header("Content-Security-Policy", live_csp()).body(out).unwrap();
     }
     base().status(StatusCode::OK).header("Content-Length", len.to_string()).body(buf).unwrap()
 }

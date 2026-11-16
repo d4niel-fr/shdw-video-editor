@@ -26,13 +26,8 @@
       }
     ],
     "security": {
-      "csp": null,
-      "assetProtocol": {
-        "enable": true,
-        "scope": [
-          "**"
-        ]
-      }
+      "csp": "default-src 'self'; script-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: media: http://media.localhost https://media.localhost; media-src 'self' blob: media: http://media.localhost https://media.localhost; font-src 'self' data: media: http://media.localhost https://media.localhost; connect-src 'self' ipc: http://ipc.localhost blob: data: media: http://media.localhost https://media.localhost; frame-src media: http://media.localhost https://media.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' blob: 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: media: http://media.localhost https://media.localhost; media-src 'self' blob: media: http://media.localhost https://media.localhost; font-src 'self' data: media: http://media.localhost https://media.localhost; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420 http://localhost:1420 blob: data: media: http://media.localhost https://media.localhost; frame-src media: http://media.localhost https://media.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'"
     }
   },
   "bundle": {
@@ -46,7 +41,7 @@
       "icons/icon.ico"
     ],
     "publisher": "d4niel-fr",
-    "copyright": "Copyright (C) 2026 d4niel-fr — AGPL-3.0 with attribution terms",
+    "copyright": "Copyright (C) 2026 d4niel-fr \u2014 AGPL-3.0 with attribution terms",
     "category": "Video",
     "shortDescription": "AI-native video editor with Claude Code / Codex built in",
     "longDescription": "shdw is an open-source, DaVinci Resolve-style video editor where Claude Code or Codex edits your timeline, writes motion graphics in code, grades, captions and exports.",
